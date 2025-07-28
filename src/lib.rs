@@ -1,102 +1,80 @@
-use chrono::Utc;
-use pin_project_lite::pin_project;
-use reqwest::{Error as ReqwestError, RequestBuilder, Response, StatusCode};
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use reqwest::{Error as ReqwestError, Response, StatusCode};
 use std::time::Duration;
-use thiserror::Error;
-use tokio::time::{sleep, Sleep};
 
+mod config;
+mod error;
+mod retry_future;
+mod trait_impl;
+pub use config::RetryConfig;
+pub use error::RetryError;
+pub use retry_future::RetryFuture;
+pub use trait_impl::RetryExt;
+pub mod backoff;
+pub mod predicates;
+
+// Example usage documentation
 #[cfg(doc)]
 mod examples;
-pub mod predicates;
+
+#[cfg(test)]
 mod tests;
 
-/// Errors that can occur during retry operations
-#[derive(Error, Debug)]
-pub enum RetryError {
-    #[error("Maximum retry attempts exceeded")]
-    MaxRetriesExceeded,
-    #[error("Request failed with non-retryable error: {0}")]
-    NonRetryableError(ReqwestError),
-    #[error("Request failed: {0}")]
-    RequestError(ReqwestError),
-    #[error("Cannot clone request builder - request body may not be cloneable")]
-    RequestBuilderCloneError,
-    #[error("Request builder not available")]
-    RequestBuilderNotAvailable,
-}
-
-/// Configuration for retry behavior
+/// Information about the current retry attempt
 #[derive(Debug, Clone)]
-pub struct RetryConfig {
-    /// Maximum number of retry attempts
-    pub max_retries: usize,
-    /// Base delay for exponential backoff
-    pub base_delay: Duration,
-    /// Maximum delay for exponential backoff
-    pub max_delay: Duration,
-    /// Multiplier for exponential backoff
-    pub backoff_multiplier: f64,
-    /// Function to determine if an error should trigger a retry
-    pub should_retry: fn(&ReqwestError) -> bool,
-    /// Function to determine if a response should trigger a retry
-    pub should_retry_response: fn(&reqwest::Response) -> bool,
+pub struct RetryAttempt {
+    /// Current attempt number (0-based)
+    pub attempt: usize,
+    /// Total number of attempts that will be made
+    pub max_attempts: usize,
+    /// Delay that will be applied before this retry
+    pub delay: Duration,
+    /// The error that triggered this retry (if any)
+    pub error: Option<String>,
+    /// The response status that triggered this retry (if any)
+    pub response_status: Option<u16>,
+    /// The type of error that triggered this retry
+    pub error_type: RetryReason,
 }
 
-impl Default for RetryConfig {
+/// The reason why a retry is being attempted
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RetryReason {
+    /// Network-level error (connection, timeout, etc.)
+    NetworkError,
+    /// HTTP server error (5xx status codes)
+    ServerError,
+    /// Rate limiting (429 status code)
+    RateLimit,
+    /// Request error (malformed request, etc.)
+    RequestError,
+    /// Custom error type defined by user
+    Custom(String),
+}
+
+/// Error-specific retry strategy
+#[derive(Clone)]
+pub struct ErrorStrategy {
+    /// Maximum retries for this error type
+    pub max_retries: Option<usize>,
+    /// Custom backoff function for this error type
+    pub backoff_fn: Option<fn(usize, Duration, f64, Duration) -> Duration>,
+    /// Base delay override for this error type
+    pub base_delay: Option<Duration>,
+    /// Max delay override for this error type
+    pub max_delay: Option<Duration>,
+    /// Backoff multiplier override for this error type
+    pub backoff_multiplier: Option<f64>,
+}
+
+impl Default for ErrorStrategy {
     fn default() -> Self {
         Self {
-            max_retries: 0,
-            base_delay: Duration::from_millis(100),
-            max_delay: Duration::from_millis(30),
-            backoff_multiplier: 2.0,
-            should_retry: default_should_retry_error,
-            should_retry_response: default_should_retry_response,
+            max_retries: None,
+            backoff_fn: None,
+            base_delay: None,
+            max_delay: None,
+            backoff_multiplier: None,
         }
-    }
-}
-
-impl RetryConfig {
-    /// Create a new RetryConfig with default values
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set maximum number of retries
-    pub fn max_retries(mut self, max_retries: usize) -> Self {
-        self.max_retries = max_retries;
-        self
-    }
-
-    /// Set base delay for exponential backoff
-    pub fn base_delay(mut self, delay: Duration) -> Self {
-        self.base_delay = delay;
-        self
-    }
-
-    /// Set maximum delay between retries
-    pub fn max_delay(mut self, delay: Duration) -> Self {
-        self.max_delay = delay;
-        self
-    }
-
-    /// Set backoff multiplier
-    pub fn backoff_multiplier(mut self, multiplier: f64) -> Self {
-        self.backoff_multiplier = multiplier;
-        self
-    }
-
-    /// Set custom error retry predicate
-    pub fn should_retry_error(mut self, predicate: fn(&ReqwestError) -> bool) -> Self {
-        self.should_retry = predicate;
-        self
-    }
-
-    /// Set custom response retry predicate
-    pub fn should_retry_response(mut self, predicate: fn(&Response) -> bool) -> Self {
-        self.should_retry_response = predicate;
-        self
     }
 }
 
@@ -113,198 +91,96 @@ fn default_should_retry_error(error: &ReqwestError) -> bool {
 fn default_should_retry_response(response: &Response) -> bool {
     // Retry on server errors and some client errors
     let status = response.status();
-    let should_retry = status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS; // Too Many Requests
-    let now = Utc::now().to_rfc3339();
-    println!(
-        "{now}, Response status: {} -> should retry: {}",
-        status, should_retry
-    );
-    should_retry
+    status.is_server_error() || status == 429 // Too Many Requests
 }
 
-/// Extension trait for reqwest::RequestBuilder to add retry functionality
-pub trait RetryExt {
-    /// add retry functionality with default configuration
-    fn or_retry(self) -> RetryFuture;
-
-    /// Add retry functionality with custom configuration
-    fn or_retry_with_config(self, config: RetryConfig) -> RetryFuture;
-}
-
-impl RetryExt for reqwest::RequestBuilder {
-    fn or_retry(self) -> RetryFuture {
-        // RetryFuture::new(self, RetryConfig::default())
-        RetryExt::or_retry_with_config(self, RetryConfig::default())
-    }
-
-    fn or_retry_with_config(self, config: RetryConfig) -> RetryFuture {
-        println!("Using retry config: {:?}", config);
-        RetryFuture::new(self, config)
+/// Default response classifier
+fn default_response_classifier(response: &Response) -> RetryReason {
+    let status = response.status();
+    if status.is_server_error() {
+        RetryReason::ServerError
+    } else if status == StatusCode::TOO_MANY_REQUESTS {
+        RetryReason::RateLimit
+    } else {
+        RetryReason::RequestError
     }
 }
 
-pin_project! {
-    /// Future that handles the retry logic
-    pub struct RetryFuture {
-        request_builder: Option<reqwest::RequestBuilder>,
-        config: RetryConfig,
-        attempts: usize,
-        #[pin]
-        state: RetryState,
-    }
-}
-
-pin_project! {
-    #[project = RetryStateProj]
-    enum RetryState {
-        Ready,
-        Requesting {
-            #[pin]
-            future: Pin<Box<dyn Future<Output = Result<Response, ReqwestError>> + Send>>,
-        },
-        Sleeping {
-             #[pin]
-            sleep: Sleep,
-        },
-        Done,
-    }
-}
-
-impl RetryFuture {
-    fn new(request_builder: RequestBuilder, config: RetryConfig) -> Self {
-        Self {
-            request_builder: Some(request_builder),
-            config,
-            attempts: 0,
-            state: RetryState::Ready,
+/// Default error classifier for reqwest errors
+fn default_error_classifier(error: &ReqwestError) -> RetryReason {
+    if error.is_timeout() || error.is_connect() {
+        RetryReason::NetworkError
+    } else if error.is_request() {
+        RetryReason::RequestError
+    } else if let Some(status) = error.status() {
+        if status.is_server_error() {
+            RetryReason::ServerError
+        } else if status == StatusCode::TOO_MANY_REQUESTS {
+            RetryReason::RateLimit
+        } else {
+            RetryReason::RequestError
         }
+    } else {
+        RetryReason::NetworkError
+    }
+}
+/// Default exponential backoff calculation
+fn default_backoff(
+    attempt: usize,
+    base_delay: Duration,
+    multiplier: f64,
+    max_delay: Duration,
+) -> Duration {
+    let exponential_delay = base_delay.as_millis() as f64 * multiplier.powi(attempt as i32);
+    let delay_ms = exponential_delay.min(max_delay.as_millis() as f64) as u64;
+    Duration::from_millis(delay_ms)
+}
+
+impl ErrorStrategy {
+    /// Create a new ErrorStrategy
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    fn calculate_delay(&self) -> Duration {
-        let exp_delay = self.config.base_delay.as_millis() as f64
-            * self.config.backoff_multiplier.powi(self.attempts as i32);
+    /// Set maximum retries for this error type
+    pub fn max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = Some(max_retries);
+        self
+    }
 
-        let delay_millis = exp_delay.min(self.config.max_delay.as_millis() as f64) as u64;
-        Duration::from_millis(delay_millis)
+    /// Set custom backoff function for this error type
+    pub fn backoff_fn(
+        mut self,
+        backoff_fn: fn(usize, Duration, f64, Duration) -> Duration,
+    ) -> Self {
+        self.backoff_fn = Some(backoff_fn);
+        self
+    }
+
+    /// Set base delay for this error type
+    pub fn base_delay(mut self, delay: Duration) -> Self {
+        self.base_delay = Some(delay);
+        self
+    }
+
+    /// Set max delay for this error type
+    pub fn max_delay(mut self, delay: Duration) -> Self {
+        self.max_delay = Some(delay);
+        self
+    }
+
+    /// Set backoff multiplier for this error type
+    pub fn backoff_multiplier(mut self, multiplier: f64) -> Self {
+        self.backoff_multiplier = Some(multiplier);
+        self
     }
 }
 
-impl Future for RetryFuture {
-    type Output = Result<Response, RetryError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.project();
-
-        loop {
-            // We need to handle state transitions outside the match to avoid borrow conflicts
-            let mut next_state: Option<RetryState> = None;
-            let mut should_continue = false;
-
-            let poll_result = match this.state.as_mut().project() {
-                RetryStateProj::Ready => {
-                    // Check if we've exceeded max retries
-                    if *this.attempts > this.config.max_retries {
-                        return Poll::Ready(Err(RetryError::MaxRetriesExceeded));
-                    }
-
-                    // Clone the request for this attempt
-                    let request = match this.request_builder.as_ref() {
-                        Some(builder) => match builder.try_clone() {
-                            Some(cloned) => cloned,
-                            None => {
-                                return Poll::Ready(Err(RetryError::RequestBuilderCloneError));
-                            }
-                        },
-                        None => {
-                            return Poll::Ready(Err(RetryError::RequestBuilderNotAvailable));
-                        }
-                    };
-
-                    // Prepare to transition to Requesting state
-                    let future = Box::pin(request.send());
-                    next_state = Some(RetryState::Requesting { future });
-                    should_continue = true;
-                    Poll::Pending // Will be overridden by continue
-                }
-
-                RetryStateProj::Requesting { future } => {
-                    match future.poll(cx) {
-                        Poll::Ready(Ok(response)) => {
-                            // Check if response indicates we should retry
-                            if (this.config.should_retry_response)(&response)
-                                && *this.attempts < this.config.max_retries
-                            {
-                                *this.attempts += 1;
-                                // Calculate delay inline
-                                let exponential_delay = this.config.base_delay.as_millis() as f64
-                                    * this.config.backoff_multiplier.powi(*this.attempts as i32);
-                                let delay_ms = exponential_delay
-                                    .min(this.config.max_delay.as_millis() as f64)
-                                    as u64;
-                                let delay = Duration::from_millis(delay_ms);
-
-                                next_state = Some(RetryState::Sleeping {
-                                    sleep: sleep(delay),
-                                });
-                                should_continue = true;
-                                Poll::Pending // Will be overridden by continue
-                            } else {
-                                Poll::Ready(Ok(response))
-                            }
-                        }
-                        Poll::Ready(Err(error)) => {
-                            // Check if this error should trigger a retry
-                            if !(this.config.should_retry)(&error) {
-                                Poll::Ready(Err(RetryError::NonRetryableError(error)))
-                            } else if *this.attempts >= this.config.max_retries {
-                                Poll::Ready(Err(RetryError::RequestError(error)))
-                            } else {
-                                *this.attempts += 1;
-                                // Calculate delay inline
-                                let exponential_delay = this.config.base_delay.as_millis() as f64
-                                    * this.config.backoff_multiplier.powi(*this.attempts as i32);
-                                let delay_ms = exponential_delay
-                                    .min(this.config.max_delay.as_millis() as f64)
-                                    as u64;
-                                let delay = Duration::from_millis(delay_ms);
-
-                                next_state = Some(RetryState::Sleeping {
-                                    sleep: sleep(delay),
-                                });
-                                should_continue = true;
-                                Poll::Pending // Will be overridden by continue
-                            }
-                        }
-                        Poll::Pending => Poll::Pending,
-                    }
-                }
-
-                RetryStateProj::Sleeping { sleep } => {
-                    match sleep.poll(cx) {
-                        Poll::Ready(()) => {
-                            next_state = Some(RetryState::Ready);
-                            should_continue = true;
-                            Poll::Pending // Will be overridden by continue
-                        }
-                        Poll::Pending => Poll::Pending,
-                    }
-                }
-
-                RetryStateProj::Done => {
-                    panic!("RetryFuture polled after completion");
-                }
-            };
-
-            // Apply state transition if needed
-            if let Some(new_state) = next_state {
-                this.state.set(new_state);
-            }
-
-            if should_continue {
-                continue;
-            } else {
-                return poll_result;
-            }
-        }
-    }
+/// Internal struct to hold the effective strategy for an error type
+struct EffectiveStrategy {
+    max_retries: usize,
+    base_delay: Duration,
+    max_delay: Duration,
+    backoff_multiplier: f64,
+    backoff_fn: fn(usize, Duration, f64, Duration) -> Duration,
 }

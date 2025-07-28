@@ -1,5 +1,5 @@
 [package]
-name = "reqwest-retry-rs"
+name = "reqwest-retry"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,8 +11,8 @@ documentation = "https://claude.ai/chat/3a9efb03-642c-498c-a3b9-ef8f9fc6cb7c"
 thiserror = "2.0.12"
 tokio = { version = "1.47.0", features = ["time"] }
 pin-project-lite = "0.2.16"
-chrono = "0.4.41"
 reqwest = "0.12.22"
+serde_json = "1.0.141"
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["test-util", "macros", "rt"] }

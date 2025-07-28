@@ -1,4 +1,3 @@
-// Custom predicates for common retry scenarios
 use reqwest::{Error as ReqwestError, Response, StatusCode};
 
 /// Retry only on network errors (no server errors)
