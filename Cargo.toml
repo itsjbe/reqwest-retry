@@ -8,10 +8,10 @@ license-file = "LICENSE"
 documentation = "https://claude.ai/chat/3a9efb03-642c-498c-a3b9-ef8f9fc6cb7c"
 
 [dependencies]
-thiserror = "2.0.12"
-tokio = { version = "1.47.0", features = ["time"] }
-pin-project-lite = "0.2.16"
-reqwest = "0.12.22"
+thiserror = "~2.0"
+tokio = { version = "~1.47", features = ["time"] }
+pin-project-lite = "~0.2"
+reqwest = "~0.12"
 serde_json = "~1.0"
 
 [dev-dependencies]
